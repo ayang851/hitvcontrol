@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# HiTVControl 集成 · 服务元数据定义 (services.yaml) --调试工具使用该文件
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 【文件作用】
+#   本文件由 Home Assistant 框架在**启动时自动加载**,无需在 Python 中
+#   import / read。它本身**不包含任何业务逻辑**,仅作为元数据为前端
+#   "开发者工具 → 动作"页面提供:
+#     · 服务的展示名 (name)
+#     · 服务的描述文案 (description)
+#     · 字段的名称、说明、示例值
+#     · 字段的 UI 选择器 (selector: text / select / number …)
+#     · 字段是否必填 (required)
+#
+# 【加载机制】
+#   框架在加载 custom_components/<domain>/ 时,会自动扫根目录下的
+#   services.yaml,将其内容合并到该域名的服务注册表里。
+#   但 YAML **只描述"服务长什么样"**,不描述"服务被调用时该干啥"。
+#   真正的执行 handler 必须由 Python 通过
+#       hass.services.async_register(DOMAIN, name, handler, schema=...)
+#   注册到 HA 服务总线。本项目的实际 handler 在 __init__.py 中。
+#
+# 【命名约束(强约定,不可改)】
+#   · 文件名固定为 services.yaml,小写、下划线分隔
+#   · 必须放在 custom_components/<domain>/ 根目录
+#   · 改名后框架不再识别(不会报错,等同于该文件不存在)
+#   · 顶层 key 即服务名,需与 async_register 的第二参数完全一致
+#
+# 【当前状态】
+#   · 本文件 YAML 内容会在"开发者工具 → 动作"页面下展示为
+#     hitvcontrol.send_command 一项。
+#   · 但实际 handler 是 __init__.py 内的内联函数,**未传入 schema**,
+#     因此 YAML 里写的字段说明/选择器**未与运行时校验联动**。
+#   · 若希望 YAML 校验真正生效,需要让 Python 注册时也传入 schema
+#     (如 services.py 中的 SERVICE_SEND_COMMAND_SCHEMA)。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 顶层 key:服务名。需与 hass.services.async_register 的第二参数对齐。
+# 完整服务 ID 在前端呈现为 "hitvcontrol.send_command"。
+send_command:
+  # 服务的展示名:显示在"开发者工具 → 动作"页面顶部 + 文档页 H1
+  name: Send Command to TV
+
+  # 服务的详细说明:UI 中是悬停 tooltip,同时被开发者文档自动抓取
+  # 注意:括号内容用全角圆括号,HA 翻译系统会按字符串原样渲染
+  description: 通过 MQTT 向指定电视发送按键指令（payload 为按键名称字符串）
+
+  # 服务的入参列表。每个 key 就是一个字段,对应前端表单的一行
+  fields:
+
+    # ─── 字段 1:目标电视的设备 ID ──────────────────────────────────────
+    # 用途:在 hass.data[DOMAIN] 中查找对应的 config entry
+    # 匹配逻辑见 __init__.py 中 handle_send_command 的两次 for 循环:
+    #   1. 先按 device_id 精确匹配
+    #   2. 未命中再按 entity_id 匹配
+    # 两种格式都接受,用户可从前端 UI 复制 entity_id 直接使用
+    device_id:
+      # 字段的展示名(前端 label)
+      name: Device ID
+      # 字段的说明:说明两种格式都支持,举例避免拼错
+      # HA 框架 services.yaml 的 name 字段在某些版本中不接受 / 斜杠,
+      # 所以这里只改 description,保持 name 兼容。
+      description: 目标电视的标识 ID(可填 device_id 或 entity_id,从前端仪表盘直接复制 entity_id 也可)
+      # 是否必填:为 true 时,调用时若缺此字段,HA 直接拒绝并报错
+      required: true
+      # 示例值:提供一个真实 device_id 作为参考
+      example: "245673fa02804c30a0ef8e68026b9252"
+      # UI 选择器:text 表示渲染为单行文本输入框
+      # 也可写 entity / device / select / number 等,见 HA 文档
+      selector:
+        text:
+
+    # ─── 字段 2:要发送的按键名称 ──────────────────────────────────────
+    # 用途:payload 直接为按键名称字符串(无 JSON 包装),通过 MQTT
+    # publish 到 /remoteapp/tv/hiservice_cmd/{device_id}/actions/sendkey
+    # 合法取值见 const.py 中的 KEY_* 常量(KEY_POWER / KEY_OK / KEY_MUTE …)
+    command:
+      # 字段的展示名
+      name: Command
+      # 字段的说明,括号里举两个最常用的按键名作为示例
+      description: 要发送的按键名称（如 KEY_OK、KEY_POWER）
+      # 必填:发空字符串会触发 mqtt publish 一个空 payload,电视端不响应
+      required: true
+      # 示例值:KEY_OK 是最常用的"确认"键
+      example: "KEY_OK"
+      # UI 选择器:text 单行文本
+      # 进阶用法:可改成 select + options 列表,前端渲染为下拉框,
+      # 强约束用户只能选 const.py 中已定义的 KEY_*,避免拼错
+      selector:
+        text:

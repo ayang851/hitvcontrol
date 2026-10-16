@@ -1,0 +1,42 @@
+{
+  "title": "Hisense Home",
+  "config": {
+    "step": {
+      "select_device": {
+        "title": "选择电视",
+        "description": "已主动扫描到多台运行 HomeLink 服务的 DLNA/UPnP 设备，请选择要添加的电视。\n\n以下电视已绑定、无法重复添加：\n{bound_devices}",
+        "data": {
+          "device": "电视"
+        }
+      },
+      "pin": {
+        "title": "输入 PIN 码",
+        "description": "请在电视端打开 HomeLink 应用获取 PIN 码并输入。",
+        "data": {
+          "pin": "电视端 PIN 码"
+        }
+      },
+      "dashboard": {
+        "title": "选择仪表盘",
+        "description": "请选择要把遥控器卡片放到哪个 Lovelace 仪表盘；如不需要，可选择「跳过，不添加到仪表盘」。卡片将放入该仪表盘的第一个已有视图，没有视图时自动新建。",
+        "data": {
+          "dashboard_choice": "目标仪表盘"
+        }
+      }
+    },
+    "error": {
+      "invalid_pin": "PIN 码验证失败，请确认 PIN 码是否正确",
+      "already_bound": "该电视已绑定，无法重复添加。如需重新绑定，请先删除已有条目。"
+    },
+    "abort": {
+      "already_in_progress": "A configuration flow for this integration is already in progress. Finish or cancel it and try again.\n\nIf no in-progress flow is shown, a stale flow is left over from an earlier attempt (closing the page directly does not cancel the flow). Restart Home Assistant and try again.",
+      "already_configured": "该设备已配置",
+      "all_devices_bound": "以下电视均已绑定，无需重复添加：\n{bound_devices}",
+      "no_ssdp_response": "主动 SSDP 扫描在 5 秒内未收到任何响应。请确认电视已开启 DLNA/UPnP；若使用 Docker Desktop，请注意其可能阻止 UDP 多播。",
+      "no_homelink_device": "已收到 SSDP 响应，但没有设备开放 HomeLink MQTT 端口 37771。请确认电视端 HomeLink 服务正在运行。",
+      "scan_failed": "无法发送或接收 SSDP 扫描数据。请检查 Home Assistant 所在网络是否允许 UDP 多播（239.255.255.250:1900）。",
+      "invalid_discovery": "未能从电视的 DLNA 广播中取得网络地址。",
+      "not_supported": "发现的 DLNA 设备未运行 HomeLink 服务。"
+    }
+  }
+}
