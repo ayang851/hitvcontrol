@@ -28,6 +28,7 @@ from .const import (
     CONF_NEW_VIEW_TITLE,
     CONF_PIN,
     CONF_VIEW_PATH,
+    DEFAULT_AUTO_ADD_DASHBOARD,
     DOMAIN,
     MQTT_CONNECT_TIMEOUT,
     MQTT_CREDENTIAL_PWD_SALT,
@@ -93,7 +94,8 @@ class TVControlConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         available_devices = await self._async_filter_homelink_devices(devices)
         if not available_devices:
-            return self.async_abort(reason="no_homelink_device")
+            # SSDP 扫描到了电视但无法连接 HomeLink MQTT 端口，给用户手动输入 IP 的入口。
+            return await self.async_step_manual_ip()
 
         # 已绑定的电视不进下拉选项（彻底无法被选中），改为在表单描述中
         # 列出名称 + IP 并给出说明；下拉选项只保留未绑定的电视。
@@ -164,6 +166,29 @@ class TVControlConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if device.get("id") in self._configured_unique_ids():
             return self._async_show_select_device_form({"base": "already_bound"})
         return await self._async_select_device(device)
+
+    async def async_step_manual_ip(self, user_input=None):
+        """SSDP 未发现可用电视时，允许用户手动输入 IP 地址绑定。"""
+        errors = {}
+
+        if user_input is not None:
+            host = user_input[CONF_HOST].strip()
+            if not await self._test_tcp_connection(host, MQTT_PORT):
+                errors["base"] = "cannot_connect"
+            else:
+                self._host = host
+                self._name = f"电视 {host}"
+                # 手动输入时以 IP 作为临时唯一标识；PIN 验证后若未获取到 MAC 再用 uuid 兜底。
+                self._device_id = host
+                return await self.async_step_pin()
+
+        return self.async_show_form(
+            step_id="manual_ip",
+            data_schema=vol.Schema({
+                vol.Required(CONF_HOST): str,
+            }),
+            errors=errors,
+        )
 
     async def async_step_ssdp(self, discovery_info: Any):
         """处理 HA 被动收到的兼容 DLNA/UPnP SSDP 广播。"""
@@ -495,14 +520,20 @@ class TVControlConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not connected:
                 errors["base"] = "invalid_pin"
             else:
-                # PIN 验证通过，保存凭据并进入仪表盘选择步骤。
+                # PIN 验证通过，保存凭据。
                 # device_id 使用 DLNA modelDescription 中的 MAC 身份（macWifi|macEthernet），
                 # 比 uuid4 更稳定：即使电视 UDN 变化或跨网切换，仍能通过 MAC 识别同一设备。
                 self._device_id = getattr(self, "_device_id", None) or uuid.uuid4().hex
                 self._pin = pin
                 self._mqtt_username = mqtt_username
                 self._mqtt_password = mqtt_password
-                return await self.async_step_dashboard()
+
+                # 代码级开关 DEFAULT_AUTO_ADD_DASHBOARD 控制是否自动进入仪表盘选择步骤。
+                # 默认 False：直接完成绑定，UI 由用户自行搭建。
+                # 改为 True 后，PIN 验证通过会弹出仪表盘选择页面并自动写入卡片。
+                if DEFAULT_AUTO_ADD_DASHBOARD:
+                    return await self.async_step_dashboard()
+                return self._async_create_dashboard_entry(add_to_dashboard=False)
 
         data_schema = vol.Schema({
             vol.Required(CONF_PIN): str,

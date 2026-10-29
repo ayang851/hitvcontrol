@@ -27,12 +27,10 @@
 #   · 顶层 key 即服务名,需与 async_register 的第二参数完全一致
 #
 # 【当前状态】
-#   · 本文件 YAML 内容会在"开发者工具 → 动作"页面下展示为
-#     hitvcontrol.send_command 一项。
-#   · 但实际 handler 是 __init__.py 内的内联函数,**未传入 schema**,
-#     因此 YAML 里写的字段说明/选择器**未与运行时校验联动**。
-#   · 若希望 YAML 校验真正生效,需要让 Python 注册时也传入 schema
-#     (如 services.py 中的 SERVICE_SEND_COMMAND_SCHEMA)。
+#   · 本文件 YAML 内容会在"开发者工具 → 动作"页面下展示为四项：
+#     hitvcontrol.send_command / send_text_command / launch_app / refresh_apps。
+#   · 字段校验已在 __init__.py 的 async_register 传入 schema（以 Python 侧为准），
+#     这里只负责 UI 展示的文案与选择器。
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 顶层 key:服务名。需与 hass.services.async_register 的第二参数对齐。
@@ -48,25 +46,25 @@ send_command:
   # 服务的入参列表。每个 key 就是一个字段,对应前端表单的一行
   fields:
 
-    # ─── 字段 1:目标电视的设备 ID ──────────────────────────────────────
+    # ─── 字段 1:目标电视 ───────────────────────────────────────────────
     # 用途:在 hass.data[DOMAIN] 中查找对应的 config entry
-    # 匹配逻辑见 __init__.py 中 handle_send_command 的两次 for 循环:
+    # 匹配逻辑见 __init__.py 中 _find_entry_data 的两次 for 循环:
     #   1. 先按 device_id 精确匹配
     #   2. 未命中再按 entity_id 匹配
-    # 两种格式都接受,用户可从前端 UI 复制 entity_id 直接使用
+    # 保持 text 输入（曾经试用 entity 下拉，实际体验差：
+    #   dropdown 会展开覆盖下方字段，且同一台电视会同时列出
+    #   remote.xxx 与 media_player.xxx 两个同名条目，难以区分）。
+    # 两种写法都接受，用户从中前端状态页/日志里复制哪个都行。
     device_id:
       # 字段的展示名(前端 label)
       name: Device ID
       # 字段的说明:说明两种格式都支持,举例避免拼错
-      # HA 框架 services.yaml 的 name 字段在某些版本中不接受 / 斜杠,
-      # 所以这里只改 description,保持 name 兼容。
-      description: 目标电视的标识 ID(可填 device_id 或 entity_id,从前端仪表盘直接复制 entity_id 也可)
+      description: 目标电视的 device_id 或 entity_id（从状态页或日志中复制即可）
       # 是否必填:为 true 时,调用时若缺此字段,HA 直接拒绝并报错
       required: true
-      # 示例值:提供一个真实 device_id 作为参考
-      example: "245673fa02804c30a0ef8e68026b9252"
+      # 示例值:entity_id 比 32 位 device_id 更好记，作为默认示例
+      example: "media_player.ke_ting_dian_shi"
       # UI 选择器:text 表示渲染为单行文本输入框
-      # 也可写 entity / device / select / number 等,见 HA 文档
       selector:
         text:
 
@@ -86,5 +84,92 @@ send_command:
       # UI 选择器:text 单行文本
       # 进阶用法:可改成 select + options 列表,前端渲染为下拉框,
       # 强约束用户只能选 const.py 中已定义的 KEY_*,避免拼错
+      selector:
+        text:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# send_text_command:发送文本控制指令到电视
+#   MQTT: /remoteapp/tv/homelink_cmd/{device_id}/actions/voice_text
+#   payload: 任意文本字符串（如 JSON、自定义协议报文），电视端接收后自定义解析
+# ─────────────────────────────────────────────────────────────────────────────
+send_text_command:
+  name: Send Text Command to TV
+  description: 通过 MQTT 向指定电视发送文本控制指令（payload 为任意文本字符串，电视端自定义解析）
+  fields:
+    device_id:
+      name: Device ID
+      description: 目标电视的 device_id 或 entity_id（从状态页或日志中复制即可）
+      required: true
+      example: "media_player.ke_ting_dian_shi"
+      selector:
+        text:
+    text:
+      name: Text
+      description: 要发送的文本内容（如 JSON、自定义协议报文等）
+      required: true
+      example: '{"action":"open_settings"}'
+      selector:
+        text:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# launch_app:启动电视上的应用
+#   MQTT: /remoteapp/tv/homelink/actions/launchapp
+#   payload: {"type": "package" | "uri", "id": "<包名或深链>"}
+#   type=package → 电视端 getLaunchIntentForPackage(id)
+#   type=uri     → 电视端 ACTION_VIEW + Uri.parse(id)
+# ─────────────────────────────────────────────────────────────────────────────
+launch_app:
+  name: Launch App
+  description: 在指定电视上启动应用（app_id 可填应用名、包名或深链；启动方式默认 auto）
+  fields:
+    device_id:
+      name: Device ID
+      description: 目标电视的 device_id 或 entity_id（从状态页或日志中复制即可）
+      required: true
+      example: "media_player.ke_ting_dian_shi"
+      # 文本输入:同 send_command，不用 entity 下拉（会遮挡下方字段）
+      selector:
+        text:
+    app_id:
+      name: App
+      # 注：应用列表是电视实时上报的，服务 schema 只能写静态 options，
+      # 因此这里无法做“下拉选应用”。要下拉选应用请用：
+      #   · 媒体播放器实体的 source 下拉（media_player。select_source）；
+      #   · 仪表盘里的应用宫格（点图标就直接 launchapp）。
+      # 这里手填应用名/包名/深链，auto 模式下会先按应用名匹配包名。
+      description: 应用名（如爱奇艺）、包名（com.qiyi.video）或深链（qiyi://xxx）
+      required: true
+      example: "com.qiyi.video"
+      selector:
+        text:
+    # 启动方式（launch_type）故意不在 UI 暴露：
+    #   后端 SCHEMA_LAUNCH_APP 已写 vol.Optional(default="auto")，
+    #   不传就是 auto（先匹配应用名→含 "://" 视为深链→否则当包名）。
+    #   以前这里放一个下拉框，用户还得判断选哪个；实际 99% 场景都是 auto。
+    # 需要强制 type=uri / package 时仍可写（服务校验以 Python schema 为准，
+    # 不依赖本文件的字段声明）：
+    #   data: {device_id: media_player.xxx, app_id: "qiyi://xxx", launch_type: uri}
+    # 若要恢复 UI 下拉框，把下面这段放回 fields 即可：
+    #   launch_type:
+    #     name: Launch Type
+    #     required: true
+    #     default: "auto"
+    #     selector: { select: { mode: dropdown, options: [auto, package, uri] } }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# refresh_apps:重新拉取电视应用列表
+#   MQTT: HA 发布 /remoteapp/tv/homelink/actions/getapps
+#         电视回推 /remoteapp/mobile/homelink/apps
+# ─────────────────────────────────────────────────────────────────────────────
+refresh_apps:
+  name: Refresh Apps
+  description: 重新向电视请求应用列表（会重写仪表盘里的应用宫格）
+  fields:
+    device_id:
+      name: Device ID
+      description: 目标电视的 device_id 或 entity_id（从状态页或日志中复制即可）
+      required: true
+      example: "media_player.ke_ting_dian_shi"
+      # 文本输入:同上
       selector:
         text:

@@ -845,6 +845,24 @@ async def _async_update_apps_dashboard(
             existing_index = idx
             break
 
+    if existing_index is None:
+        # 旧版本写下的占位 section 不带实体标记，无法按 entity 归属，
+        # 只能按文案识别；这里就地复用它的位置，避免占位与应用宫格并存
+        existing_index = next(
+            (
+                idx
+                for idx, section in enumerate(sections)
+                if isinstance(section, dict)
+                and _is_legacy_apps_placeholder(section)
+            ),
+            None,
+        )
+        if existing_index is not None:
+            _LOGGER.info(
+                "[Dashboard] 仪表盘 %s 中命中旧版应用占位 section，就地替换",
+                dash_id,
+            )
+
     apps_section = _build_apps_section(media_entity_id, apps)
 
     if existing_index is not None:
@@ -949,36 +967,107 @@ async def _async_delete_apps_from_dashboard(
         return False
 
 
+# 应用宫格 section 的实体归属标记：写在 markdown 注释里（前端不渲染）。
+# 占位 section 没有任何卡片动作，只能靠这个标记被 _is_apps_section 认出来，
+# 否则应用列表到手后会被当成新 section 追加，占位提示永远留在页面上。
+APPS_SECTION_MARKER = "hitvcontrol:apps:"
+
+# 旧版本占位 section 的识别文案（早期写占位时没带实体标记）
+_LEGACY_PLACEHOLDER_TEXT = "电视尚未上报应用列表"
+
+
 def _is_apps_section(section: dict, entity_id: str) -> bool:
     """判断 section 是否是由本集成为指定 media_player 实体生成的应用宫格."""
     section_str = str(section)
     if entity_id not in section_str:
         return False
+    # 有卡片时靠动作识别；空列表占位没有动作，靠注释标记识别
+    if f"{APPS_SECTION_MARKER}{entity_id}" in section_str:
+        return True
     return "media_player.play_media" in section_str
+
+
+def _is_legacy_apps_placeholder(section: dict) -> bool:
+    """判断 section 是否为旧版本写入、未带实体标记的应用占位."""
+    section_str = str(section)
+    if _LEGACY_PLACEHOLDER_TEXT not in section_str:
+        return False
+    # 新版占位带标记，走 _is_apps_section 的实体匹配，不在这里处理
+    return APPS_SECTION_MARKER not in section_str
 
 
 def _build_apps_section(media_entity_id: str, apps: list[dict]) -> dict:
     """构建应用宫格 section.
 
-    布局：sections 视图下的普通 section，内部放一张 grid card（columns=4），
-    grid card 里每个应用一张 button 卡片，点击触发 media_player.play_media。
+    布局：sections 视图下的普通 section，内部放一张 grid card（columns=4）。
+      - 电视回推了图标（已落盘到 <config>/www/hitvcontrol/apps）→
+        用 picture-entity 卡片展示图标 + 应用名；
+      - 没有图标 → 退回 button 卡片（mdi:application + 应用名）。
+    两种卡片的 tap_action 都调 media_player.play_media 启动对应应用。
+
+    卡片类型选择说明：
+      旧版 HA 的 type: image 卡片已被新版前端移除（会渲染成「配置错误」），
+      type: picture 则只显示图片、不带文字。
+      这里用 picture-entity：它支持 image 指定图片、name 覆盖标题、
+      show_name 在底部显示应用名，同时支持 tap_action，是同时满足
+      「真实图标 + 应用名 + 可点击」的标准卡片。
+      entity 填本设备的 media_player 仅用于撑起卡片与状态判断，
+      show_state: false 避免把播放状态显示出来。
     """
+    if not apps:
+        return {
+            "title": "应用",
+            "cards": [
+                {
+                    "type": "markdown",
+                    # 开头是不可见的注释标记（markdown 不渲染 HTML 注释）：
+                    # 让占位 section 也能被 _is_apps_section 按实体识别，
+                    # 应用列表到手后直接被替换，而不是再追加一个新 section
+                    "content": (
+                        f"<!-- {APPS_SECTION_MARKER}{media_entity_id} "
+                        "media_player.play_media -->\n"
+                        "电视尚未上报应用列表。请确认 HomeLink 已运行，"
+                        "或调用 `hitvcontrol.refresh_apps` 重新获取。"
+                    ),
+                }
+            ],
+        }
+
     app_cards = []
     for app in apps:
-        app_cards.append({
-            "type": "button",
-            "icon": app.get("icon", "mdi:application"),
-            "name": app["name"],
-            "tap_action": {
-                "action": "perform-action",
-                "perform_action": "media_player.play_media",
-                "target": {"entity_id": media_entity_id},
-                "data": {
-                    "media_content_type": "app",
-                    "media_content_id": app["package"],
-                },
+        tap_action = {
+            "action": "perform-action",
+            "perform_action": "media_player.play_media",
+            "target": {"entity_id": media_entity_id},
+            # 字段名必须用 media_content_type / media_content_id：
+            # 这是 media_player.play_media 服务 schema 实际接受的字段。
+            # media_type / media_id 只是核心转发给实体方法时的形参名，
+            # 写进卡片 data 会被服务校验拒绝（not a valid option）。
+            # 两者分工：卡片 = 旧名（对外契约），实体 = 新名（内部签名）。
+            "data": {
+                "media_content_type": "app",
+                "media_content_id": app["package"],
             },
-        })
+        }
+        icon_url = app.get("icon_url")
+        if icon_url:
+            app_cards.append({
+                "type": "picture-entity",
+                "entity": media_entity_id,
+                "image": icon_url,
+                "name": app["name"],
+                "show_name": True,
+                "show_state": False,
+                "fit_mode": "contain",
+                "tap_action": tap_action,
+            })
+        else:
+            app_cards.append({
+                "type": "button",
+                "icon": "mdi:application",
+                "name": app["name"],
+                "tap_action": tap_action,
+            })
 
     return {
         "title": "应用",

@@ -17,17 +17,20 @@ import socket
 import ssl
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 from urllib.parse import urlparse
 
 from aiomqtt import Client, ProtocolVersion, Will
 from homeassistant.components.remote import RemoteEntity, RemoteEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
+    APP_LIST_POLL_INTERVAL,
+    APP_LIST_TIMEOUT,
     CONF_ADD_TO_DASHBOARD,
     CONF_DASHBOARD_ID,
     CONF_DEVICE_ID,
@@ -49,16 +52,32 @@ from .const import (
     MQTT_TLS_CA_FILENAME,
     MQTT_TLS_CERT_FILENAME,
     MQTT_TLS_KEY_FILENAME,
+    MQTT_TOPIC_APPS_WILDCARD,
     MQTT_TOPIC_BROADCAST,
     MQTT_TOPIC_CALLBACK,
     MQTT_TOPIC_LASTWILL,
 )
+from .apps import AppListManager
 from .dashboard import async_create_remote_dashboard_card, async_delete_remote_dashboard_card
 
 _LOGGER = logging.getLogger(__name__)
 
 # 组件目录的绝对路径，用于定位证书文件（ca.pem / client.pem / client.key）
 _COMPONENT_DIR = Path(__file__).resolve().parent
+
+# MQTT 收发日志里 payload 的截断长度。
+# 按键/启动应用这类小包会完整打印；app 列表（带 base64 图标）可达数百 KB，
+# 只保留开头一小段+总长度，否则会把日志文件写爆。
+_LOG_PAYLOAD_LIMIT = 500
+
+
+def _truncate_for_log(payload: str) -> str:
+    """把 payload 截断到日志可接受的长度，并标明被截掉的字数."""
+    if len(payload) <= _LOG_PAYLOAD_LIMIT:
+        return payload
+    return (
+        f"{payload[:_LOG_PAYLOAD_LIMIT]}...(+{len(payload) - _LOG_PAYLOAD_LIMIT} chars)"
+    )
 
 
 async def async_setup_entry(
@@ -98,6 +117,7 @@ class TVMQTTClient:
         mqtt_username: str,
         mqtt_password: str,
         on_disconnected: Callable[[], None] | None = None,
+        on_message: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         """初始化 MQTT 客户端.
 
@@ -108,6 +128,8 @@ class TVMQTTClient:
             mqtt_username: MQTT 认证用户名（由 PIN 码派生）。
             mqtt_password: MQTT 认证密码（由 PIN 码派生）。
             on_disconnected: 连接异常断开时的回调，在 HA 事件循环线程调用。
+            on_message: 收到订阅消息时的异步回调 (topic, payload)，
+                在监听器 Task 中 await；回调异常只记日志，不影响连接。
         """
         self._host = host
         self._port = port
@@ -115,6 +137,7 @@ class TVMQTTClient:
         self._mqtt_username = mqtt_username
         self._mqtt_password = mqtt_password
         self._on_disconnected = on_disconnected
+        self._on_message = on_message
         # aiomqtt Client 实例，None 表示当前未连接
         self._client: Client | None = None
         # 消息监听后台 Task，用于检测断连；None 表示未启动
@@ -224,14 +247,17 @@ class TVMQTTClient:
         # ── 连接成功，执行后续初始化 ──
 
         # 订阅 callback_topic（接收按键响应）和 broadcast_topic（接收广播通知）
+        # 另加应用列表通配符 topic：既命中契约 topic
+        # /remoteapp/mobile/homelink/apps，也兼容带 device_id 的变体
         # 订阅失败不影响连接本身，仅记录警告
         try:
             callback_topic = MQTT_TOPIC_CALLBACK.format(device_id=self._device_id)
             broadcast_topic = MQTT_TOPIC_BROADCAST.format(device_id=self._device_id)
             await self._client.subscribe((callback_topic, 0))
             await self._client.subscribe((broadcast_topic, 0))
+            await self._client.subscribe((MQTT_TOPIC_APPS_WILDCARD, 0))
             _LOGGER.info(
-                "Subscribed to callback and broadcast topics for %s",
+                "Subscribed to callback, broadcast and apps topics for %s",
                 self._device_id,
             )
         except Exception as err:  # noqa: BLE001
@@ -296,14 +322,12 @@ class TVMQTTClient:
             销毁客户端并通知上层（TVRemote）更新为离线状态。
 
         注意：
-          当前版本收到的 MQTT 消息不做处理（pass），
-          监听器的唯一目的是检测连接断开，未来可在此扩展消息解析逻辑。
+          消息迭代器仍承担断连检测职责；收到的消息交给 on_message 回调
+          （当前用于应用列表回推），回调内的异常只记日志，不触发断连。
         """
         try:
-            async for _message in self._client.messages:  # noqa: F841
-                # 当前版本不处理收到的消息，仅利用迭代器阻塞特性检测断连
-                # 未来如需处理电视侧推送，可在此解析 _message.payload
-                pass
+            async for message in self._client.messages:
+                await self._dispatch_message(message)
         except asyncio.CancelledError:
             # 主动取消（重连前清理 / 实体卸载），不触发断连回调，直接返回
             _LOGGER.debug("Message listener cancelled for %s", self._device_id)
@@ -318,6 +342,39 @@ class TVMQTTClient:
             # 通知上层（TVRemote._on_mqtt_disconnected），触发离线状态更新和重连
             if self._on_disconnected:
                 self._on_disconnected()
+
+    async def _dispatch_message(self, message) -> None:
+        """把单条 MQTT 消息解码后交给 on_message 回调.
+
+        未注入回调时直接返回（保持旧行为：只靠迭代器阻塞检测断连）。
+        所有收到的消息都以 [MQTT←] 前缀打 INFO 日志（截断到 _LOG_PAYLOAD_LIMIT
+        字符），应用列表这类大 payload 只记录总长度，避免日志被 base64 撑爆。
+        """
+        topic = str(message.topic)
+        payload = self._decode_payload(message.payload)
+        _LOGGER.info(
+            "[MQTT←] %s topic=%s len=%s payload=%s",
+            self._device_id,
+            topic,
+            len(payload),
+            _truncate_for_log(payload),
+        )
+        if self._on_message is None:
+            return
+
+        try:
+            await self._on_message(topic, payload)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "[MQTT] 处理消息失败 topic=%s len=%s", topic, len(payload)
+            )
+
+    @staticmethod
+    def _decode_payload(payload: object) -> str:
+        """统一把 aiomqtt 的 payload（bytes/str/其他）解成 UTF-8 文本."""
+        if isinstance(payload, (bytes, bytearray)):
+            return bytes(payload).decode("utf-8", errors="replace")
+        return "" if payload is None else str(payload)
 
     async def _destroy_client(self) -> None:
         """销毁 aiomqtt Client，释放底层 TCP 连接资源.
@@ -365,17 +422,38 @@ class TVMQTTClient:
             _LOGGER.warning("MQTT client not connected, attempting reconnect")
             connected = await self.connect()
             if not connected:
-                _LOGGER.error("Reconnect failed to %s:%s", self._host, self._port)
+                _LOGGER.error(
+                    "[MQTT→] %s 发送失败: 重连 %s:%s 未成功，topic=%s payload=%s",
+                    self._device_id, self._host, self._port,
+                    topic, _truncate_for_log(payload),
+                )
                 return
 
+        _LOGGER.info(
+            "[MQTT→] %s topic=%s len=%s payload=%s",
+            self._device_id,
+            topic,
+            len(payload),
+            _truncate_for_log(payload),
+        )
         try:
             # QoS=1：确保消息至少送达 Broker 一次（允许重复，但不会丢失）
-            await self._client.publish(topic, payload, qos=1)
+            # 外层加短超时兜底：电视端 Broker 偶发不回 PUBACK，
+            # 不设超时会把调用方（如应用列表请求）一起卡死。
+            await asyncio.wait_for(
+                self._client.publish(topic, payload, qos=1),
+                timeout=MQTT_PUBLISH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "[MQTT→] %s 发送超时 (%ss) topic=%s",
+                self._device_id, MQTT_PUBLISH_TIMEOUT, topic,
+            )
         except Exception:  # noqa: BLE001
             # 发布失败通常意味着连接已断开，消息监听器会独立检测并触发重连
             _LOGGER.warning(
-                "MQTT publish failed to %s:%s, connection may be lost",
-                self._host, self._port,
+                "[MQTT→] %s 发送失败 topic=%s (连接可能已断开 %s:%s)",
+                self._device_id, topic, self._host, self._port,
             )
 
     @property
@@ -423,6 +501,10 @@ class TVRemote(RemoteEntity):
         self._device_id = data[CONF_DEVICE_ID]
         # command_topic：发送按键指令的 MQTT Topic，由 config_flow 在配对时确定
         self._command_topic = data["command_topic"]
+        # text_command_topic：发送文本控制指令的 MQTT Topic，电视端接收后自定义处理
+        self._text_command_topic = data["text_command_topic"]
+        # 应用列表管理器由 __init__.py 创建，与 remote 共用同一条 MQTT 连接
+        self._app_manager: AppListManager | None = data.get("app_manager")
 
         # ── 创建 MQTT 客户端 ──
         # 认证信息由用户在 config_flow 中输入 PIN 码后派生，固定使用 TLS 加密
@@ -435,7 +517,16 @@ class TVRemote(RemoteEntity):
             mqtt_username, mqtt_password,
             # 断连回调：连接丢失时通知本实体更新状态并启动重连
             on_disconnected=self._on_mqtt_disconnected,
+            # 消息回调：把电视回推的应用列表交给 AppListManager 解析缓存
+            on_message=(
+                self._app_manager.async_handle_message
+                if self._app_manager is not None
+                else None
+            ),
         )
+        if self._app_manager is not None:
+            # 注入发布通道，让管理器能发 getapps / launchapp
+            self._app_manager.set_publisher(self._mqtt_client.publish)
 
         # ── HA 实体属性 ──
         self._attr_name = entry.title          # 实体显示名称
@@ -446,6 +537,8 @@ class TVRemote(RemoteEntity):
         self._reconnect_task: asyncio.Task | None = None
         # 用于唤醒重连循环的事件，断开或 broker 恢复时 set，让循环立即重试
         self._reconnect_event: asyncio.Event | None = None
+        # 应用列表轮询 Task 的引用（电视端增删应用不会主动推送，靠定时补拉）
+        self._apps_poll_task: asyncio.Task | None = None
 
     async def async_added_to_hass(self) -> None:
         """实体注册到 HA 后的初始化钩子.
@@ -466,6 +559,9 @@ class TVRemote(RemoteEntity):
         # 后台启动连接，不阻塞 HA 启动流程（见上方设计说明）
         self.hass.loop.create_task(self._async_connect())
 
+        # 应用列表定时补拉：电视端新增/卸载应用不会通知 HA，只能轮询
+        self._start_apps_poll_task()
+
         # 绑定成功后自动在默认仪表盘创建遥控器卡片（仅首次）
         self.hass.loop.create_task(self._async_ensure_dashboard_card())
 
@@ -484,6 +580,8 @@ class TVRemote(RemoteEntity):
                 self._mqtt_client._host, self._mqtt_client._port, self._device_id,
             )
             self._set_available(True)
+            # 建连后主动拉一次应用列表（拿不到只影响展示，不影响遥控）
+            self.hass.loop.create_task(self._async_request_apps())
         else:
             _LOGGER.warning(
                 "Failed to connect to TV MQTT broker at %s:%s for %s, will retry in %ss",
@@ -493,6 +591,68 @@ class TVRemote(RemoteEntity):
             self._set_available(False)
             # 连接失败，启动后台重连循环
             self._start_reconnect_task()
+
+    async def _async_request_apps(self) -> None:
+        """建连/重连成功后主动请求一次应用列表.
+
+        由 loop.create_task 驱动，不阻塞实体就绪；失败仅记日志。
+        """
+        if self._app_manager is None:
+            return
+        await self._app_manager.async_request_apps()
+
+    # ────────────────────────── 应用列表轮询 ──────────────────────────
+
+    def _start_apps_poll_task(self) -> None:
+        """启动应用列表轮询 Task（幂等，重复调用不会创建多个）."""
+        if self._app_manager is None:
+            return
+        if self._apps_poll_task and not self._apps_poll_task.done():
+            return
+        self._apps_poll_task = self.hass.loop.create_task(
+            self._async_apps_poll_loop()
+        )
+
+    def _cancel_apps_poll_task(self) -> None:
+        """取消应用列表轮询 Task（实体卸载时调用）."""
+        if self._apps_poll_task and not self._apps_poll_task.done():
+            self._apps_poll_task.cancel()
+        self._apps_poll_task = None
+
+    async def _async_apps_poll_loop(self) -> None:
+        """每隔 APP_LIST_POLL_INTERVAL 秒拉一次应用列表.
+
+        背景：电视端只在 HA 请求时回推 apps，新增/卸载应用不会主动上报，
+        导致仪表盘上的应用宫格长期停在旧列表。这里做定时补拉：
+          - 仅在 MQTT 已连接时发请求，避免电视关机时把 publish 的
+            重连兜底路径拖成每分钟一次 TLS 握手；
+          - 单次只发 1 条 getapps、不重试，尽量轻量；
+          - 内容没变时 AppListManager 不会通知订阅者，因此不会写实体
+            状态、也不会重写仪表盘，开销仅一次 MQTT 往返。
+        """
+        _LOGGER.info(
+            "[Apps] %s 已启动应用列表轮询（每 %s 秒一次）",
+            self._device_id, APP_LIST_POLL_INTERVAL,
+        )
+        while True:
+            try:
+                await asyncio.sleep(APP_LIST_POLL_INTERVAL)
+                if not self._mqtt_client.connected:
+                    _LOGGER.debug(
+                        "[Apps] %s 轮询跳过：MQTT 未连接", self._device_id
+                    )
+                    continue
+                await self._app_manager.async_request_apps(
+                    attempts=1, timeout=APP_LIST_TIMEOUT
+                )
+            except asyncio.CancelledError:
+                _LOGGER.debug("[Apps] %s 应用列表轮询已停止", self._device_id)
+                return
+            except Exception:  # noqa: BLE001
+                # 单轮失败不影响下一轮，避免任务静默退出
+                _LOGGER.exception(
+                    "[Apps] %s 应用列表轮询出错", self._device_id
+                )
 
     async def _async_ensure_dashboard_card(self) -> None:
         """首次加载时，按用户在 config_flow 中的选择创建遥控器卡片."""
@@ -810,6 +970,8 @@ class TVRemote(RemoteEntity):
                         self._mqtt_client._host, self._mqtt_client._port, self._device_id,
                     )
                     self._set_available(True)
+                    # 重连成功后同样补拉一次应用列表
+                    self.hass.loop.create_task(self._async_request_apps())
                     return  # 重连成功，退出循环；消息监听器接管后续断连检测
 
                 attempt += 1
@@ -849,6 +1011,7 @@ class TVRemote(RemoteEntity):
              触发 Broker 发布遗嘱消息（"CLOSE"），通知电视 HA 已下线。
           3. 清理本集成在 Lovelace 仪表盘中为该实体生成的遥控器 section。
         """
+        self._cancel_apps_poll_task()
         self._cancel_reconnect_task()
         await self._mqtt_client.disconnect()
 
@@ -889,11 +1052,14 @@ class TVRemote(RemoteEntity):
         }
 
     async def async_turn_on(self, **kwargs) -> None:
-        """开机操作——硬件不支持，空实现.
+        """开机操作——硬件不支持，显式报错.
 
         电视侧 MQTT Broker 仅在电视开机后才运行，
-        因此无法通过 MQTT 实现远程开机，此方法为空。
+        因此无法通过 MQTT 实现远程开机。
         """
+        raise HomeAssistantError(
+            "电视不支持远程开机：MQTT Broker 随电视启动，关机后无法连接。"
+        )
 
     async def async_turn_off(self, **kwargs) -> None:
         """关机操作——发送电源键指令.
@@ -901,6 +1067,30 @@ class TVRemote(RemoteEntity):
         通过发送 KEY_POWER 按键实现关机（或开关机切换，取决于电视当前状态）。
         """
         await self.async_send_command([KEY_POWER])
+
+    async def async_toggle(self, **kwargs) -> None:
+        """开关切换——不支持，显式报错.
+
+        遥控器实体只有 MQTT 连接状态（is_on），不代表电视真实开关机，
+        因此不做 toggle，避免用户以为能一键开关机而误发指令。
+        """
+        raise HomeAssistantError(
+            "电视不支持开关切换：无法判断真实开关机状态。"
+            "需要关机请用 remote.turn_off（发送 KEY_POWER）。"
+        )
+
+    async def async_learn_command(self, **kwargs) -> None:
+        """学习按键——不支持，显式报错."""
+        raise HomeAssistantError(
+            "电视不支持学习按键：本集成通过 MQTT 直接发送 KEY_* 按键名，"
+            "无需学习红外码。可用按键见 const.py 的 KEY_* 常量。"
+        )
+
+    async def async_delete_command(self, **kwargs) -> None:
+        """删除已学习按键——不支持（没有可管理的按键库）."""
+        raise HomeAssistantError(
+            "电视不支持删除按键：本集成没有可管理的学习按键库。"
+        )
 
     async def async_send_command(self, command, **kwargs) -> None:
         """向电视发送按键指令（HA Remote 平台标准接口）.
@@ -922,3 +1112,17 @@ class TVRemote(RemoteEntity):
             )
         _LOGGER.info("Remote sending command %s to %s", cmd, self._command_topic)
         await self._mqtt_client.publish(self._command_topic, cmd)
+
+    async def async_send_text_command(self, text: str) -> None:
+        """向电视发送文本控制指令.
+
+        与 async_send_command 不同：本方法把任意文本直接发布到独立的
+        text_command_topic，不经过 KEY_MAP 映射，供电视端自定义解析。
+
+        Args:
+            text: 要发送的文本字符串（如 JSON、自定义协议报文等）。
+        """
+        _LOGGER.info(
+            "Remote sending text command %s to %s", text, self._text_command_topic
+        )
+        await self._mqtt_client.publish(self._text_command_topic, text)

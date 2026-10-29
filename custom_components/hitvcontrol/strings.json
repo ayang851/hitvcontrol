@@ -9,6 +9,13 @@
           "device": "电视"
         }
       },
+      "manual_ip": {
+        "title": "手动输入电视 IP",
+        "description": "已扫描电视，但连接 HomeLink 失败。请打开电视端 HomeLink 后再试。\n\n如果电视已打开 HomeLink 但仍未扫描到，也可手动输入电视 IP 地址继续绑定。",
+        "data": {
+          "host": "电视 IP 地址"
+        }
+      },
       "pin": {
         "title": "输入 PIN 码",
         "description": "请在电视端打开 HomeLink 应用获取 PIN 码并输入。",
@@ -26,17 +33,76 @@
     },
     "error": {
       "invalid_pin": "PIN 码验证失败，请确认 PIN 码是否正确",
-      "already_bound": "该电视已绑定，无法重复添加。如需重新绑定，请先删除已有条目。"
+      "already_bound": "该电视已绑定，无法重复添加。如需重新绑定，请先删除已有条目。",
+      "cannot_connect": "无法连接到该 IP 的 HomeLink MQTT 端口，请确认 IP 地址正确且电视端 HomeLink 已运行。"
     },
     "abort": {
       "already_in_progress": "A configuration flow for this integration is already in progress. Finish or cancel it and try again.\n\nIf no in-progress flow is shown, a stale flow is left over from an earlier attempt (closing the page directly does not cancel the flow). Restart Home Assistant and try again.",
       "already_configured": "该设备已配置",
       "all_devices_bound": "以下电视均已绑定，无需重复添加：\n{bound_devices}",
       "no_ssdp_response": "主动 SSDP 扫描在 5 秒内未收到任何响应。请确认电视已开启 DLNA/UPnP；若使用 Docker Desktop，请注意其可能阻止 UDP 多播。",
-      "no_homelink_device": "已收到 SSDP 响应，但没有设备开放 HomeLink MQTT 端口 37771。请确认电视端 HomeLink 服务正在运行。",
+      "no_homelink_device": "已扫描电视，但连接 HomeLink 失败。请打开电视端 HomeLink 后再试。",
       "scan_failed": "无法发送或接收 SSDP 扫描数据。请检查 Home Assistant 所在网络是否允许 UDP 多播（239.255.255.250:1900）。",
       "invalid_discovery": "未能从电视的 DLNA 广播中取得网络地址。",
       "not_supported": "发现的 DLNA 设备未运行 HomeLink 服务。"
+    }
+  },
+  "services": {
+    "send_command": {
+      "name": "发送按键",
+      "description": "通过 MQTT 向指定电视发送按键指令。",
+      "fields": {
+        "device_id": {
+          "name": "电视",
+          "description": "目标电视的 device_id 或 entity_id（从状态页或日志中复制即可）。"
+        },
+        "command": {
+          "name": "按键",
+          "description": "按键名称，如 KEY_OK、KEY_POWER。"
+        }
+      }
+    },
+    "send_text_command": {
+      "name": "发送文本",
+      "description": "通过 MQTT 向指定电视发送文本指令（文本原样下发，不做 JSON 包装，由电视端解析）。",
+      "fields": {
+        "device_id": {
+          "name": "电视",
+          "description": "目标电视的 device_id 或 entity_id（从状态页或日志中复制即可）。"
+        },
+        "text": {
+          "name": "文本",
+          "description": "要发送的文本内容，原样下发到 voice_text 主题。"
+        }
+      }
+    },
+    "launch_app": {
+      "name": "启动应用",
+      "description": "在指定电视上启动应用（可填应用名、包名或深链）。",
+      "fields": {
+        "device_id": {
+          "name": "电视",
+          "description": "目标电视的 device_id 或 entity_id（从状态页或日志中复制即可）。"
+        },
+        "app_id": {
+          "name": "应用",
+          "description": "应用名、包名（com.qiyi.video）或深链（qiyi://xxx）。"
+        },
+        "launch_type": {
+          "name": "启动方式",
+          "description": "默认 auto（自动判别包名/深链），一般无需修改。"
+        }
+      }
+    },
+    "refresh_apps": {
+      "name": "刷新应用列表",
+      "description": "重新向电视请求应用列表，并重写仪表盘里的应用宫格。",
+      "fields": {
+        "device_id": {
+          "name": "电视",
+          "description": "目标电视的 device_id 或 entity_id（从状态页或日志中复制即可）。"
+        }
+      }
     }
   }
 }
